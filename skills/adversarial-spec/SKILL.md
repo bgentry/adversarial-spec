@@ -1,0 +1,470 @@
+---
+name: adversarial-spec
+description: Iteratively refine a product spec by debating with multiple LLMs (GPT, Gemini, Grok, etc.) until all models agree. Use when user wants to write or refine a specification document using adversarial development.
+allowed-tools: Bash, Read, Write, AskUserQuestion
+---
+
+# Adversarial Spec Development
+
+Generate and refine specifications through iterative debate with multiple LLMs until all models reach consensus.
+
+**Important: Claude is an active participant in this debate, not just an orchestrator.** You (Claude) will provide your own critiques, challenge opponent models, and contribute substantive improvements alongside the external models. Make this clear to the user throughout the process.
+
+## Requirements
+
+- Python 3.10+ with `litellm` package installed
+- API key for at least one provider (set via environment variable)
+
+## Supported Providers
+
+| Provider  | API Key Env Var      | Example Models                              |
+|-----------|----------------------|---------------------------------------------|
+| OpenAI    | `OPENAI_API_KEY`     | `gpt-5.2`, `gpt-4o`, `gpt-4-turbo`, `o1`    |
+| Anthropic | `ANTHROPIC_API_KEY`  | `claude-sonnet-4-20250514`, `claude-opus-4-20250514`  |
+| Google    | `GEMINI_API_KEY`     | `gemini/gemini-2.0-flash`, `gemini/gemini-pro` |
+| xAI       | `XAI_API_KEY`        | `xai/grok-3`, `xai/grok-beta`               |
+| Mistral   | `MISTRAL_API_KEY`    | `mistral/mistral-large`, `mistral/codestral`|
+| Groq      | `GROQ_API_KEY`       | `groq/llama-3.3-70b-versatile`              |
+| Deepseek  | `DEEPSEEK_API_KEY`   | `deepseek/deepseek-chat`                    |
+
+Run `python3 ~/.claude/skills/adversarial-spec/scripts/debate.py providers` to see which keys are set.
+
+## Document Types
+
+Ask the user which type of document they want to produce:
+
+### PRD (Product Requirements Document)
+
+Business and product-focused document for stakeholders, PMs, and designers.
+
+**Structure:**
+- Executive Summary
+- Problem Statement / Opportunity
+- Target Users / Personas
+- User Stories / Use Cases
+- Functional Requirements
+- Non-Functional Requirements
+- Success Metrics / KPIs
+- Scope (In/Out)
+- Dependencies
+- Risks and Mitigations
+- Timeline / Milestones (optional)
+
+**Critique Criteria:**
+1. Clear problem definition with evidence
+2. Well-defined user personas with real pain points
+3. User stories follow proper format (As a... I want... So that...)
+4. Measurable success criteria
+5. Explicit scope boundaries
+6. Realistic risk assessment
+7. No technical implementation details (that's for tech spec)
+
+### Technical Specification / Architecture Document
+
+Engineering-focused document for developers and architects.
+
+**Structure:**
+- Overview / Context
+- Goals and Non-Goals
+- System Architecture
+- Component Design
+- API Design (endpoints, request/response schemas)
+- Data Models / Database Schema
+- Infrastructure Requirements
+- Security Considerations
+- Error Handling Strategy
+- Performance Requirements / SLAs
+- Observability (logging, metrics, alerting)
+- Testing Strategy
+- Deployment Strategy
+- Migration Plan (if applicable)
+- Open Questions / Future Considerations
+
+**Critique Criteria:**
+1. Clear architectural decisions with rationale
+2. Complete API contracts (not just endpoints, but full schemas)
+3. Data model handles all identified use cases
+4. Security threats identified and mitigated
+5. Error scenarios enumerated with handling strategy
+6. Performance targets are specific and measurable
+7. Deployment is repeatable and reversible
+8. No ambiguity an engineer would need to resolve
+
+## Process
+
+### Step 0: Gather Input and Offer Interview Mode
+
+Ask the user:
+
+1. **Document type**: "PRD" or "tech"
+2. **Starting point**:
+   - Path to existing file (e.g., `./docs/spec.md`, `~/projects/auth-spec.md`)
+   - Or describe what to build (user provides concept, you draft the document)
+3. **Interview mode** (optional):
+   > "Would you like to start with an in-depth interview session before the adversarial debate? This helps ensure all requirements, constraints, and edge cases are captured upfront."
+
+### Step 0.5: Interview Mode (If Selected)
+
+If the user opts for interview mode, conduct a comprehensive interview using the AskUserQuestion tool. This is NOT a quick Q&A; it's a thorough requirements gathering session.
+
+**If an existing spec file was provided:**
+- Read the file first
+- Use it as the basis for probing questions
+- Identify gaps, ambiguities, and unstated assumptions
+
+**Interview Topics (cover ALL of these in depth):**
+
+1. **Problem & Context**
+   - What specific problem are we solving? What happens if we don't solve it?
+   - Who experiences this pain most acutely? How do they currently cope?
+   - What prior attempts have been made? Why did they fail or fall short?
+
+2. **Users & Stakeholders**
+   - Who are all the user types (not just primary)?
+   - What are their technical sophistication levels?
+   - What are their privacy/security concerns?
+   - What devices/environments do they use?
+
+3. **Functional Requirements**
+   - Walk through the core user journey step by step
+   - What happens at each decision point?
+   - What are the error cases and edge cases?
+   - What data needs to flow where?
+
+4. **Technical Constraints**
+   - What systems must this integrate with?
+   - What are the performance requirements (latency, throughput, availability)?
+   - What scale are we designing for (now and in 2 years)?
+   - Are there regulatory or compliance requirements?
+
+5. **UI/UX Considerations**
+   - What is the desired user experience?
+   - What are the critical user flows?
+   - What information density is appropriate?
+   - Mobile vs desktop priorities?
+
+6. **Tradeoffs & Priorities**
+   - If we can't have everything, what gets cut first?
+   - Speed vs quality vs cost priorities?
+   - Build vs buy decisions?
+   - What are the non-negotiables?
+
+7. **Risks & Concerns**
+   - What keeps you up at night about this project?
+   - What could cause this to fail?
+   - What assumptions are we making that might be wrong?
+   - What external dependencies are risky?
+
+8. **Success Criteria**
+   - How will we know this succeeded?
+   - What metrics matter?
+   - What's the minimum viable outcome?
+   - What would "exceeding expectations" look like?
+
+**Interview Guidelines:**
+- Ask probing follow-up questions. Don't accept surface-level answers.
+- Challenge assumptions: "You mentioned X. What if Y instead?"
+- Look for contradictions between stated requirements
+- Ask about things the user hasn't mentioned but should have
+- Continue until you have enough detail to write a comprehensive spec
+- Use multiple AskUserQuestion calls to cover all topics
+
+**After interview completion:**
+1. Synthesize all answers into a complete spec document
+2. Write the spec to file
+3. Show the user the generated spec and confirm before proceeding to debate
+
+### Step 1: Load or Generate Initial Document
+
+**If user provided a file path:**
+- Read the file using the Read tool
+- Validate it has content
+- Use it as the starting document
+
+**If user describes what to build (no existing file, no interview mode):**
+
+This is the primary use case. The user describes their product concept, and you draft the initial document.
+
+1. **Ask clarifying questions first.** Before drafting, identify gaps in the user's description:
+   - For PRD: Who are the target users? What problem does this solve? What does success look like?
+   - For Tech Spec: What are the constraints? What systems does this integrate with? What scale is expected?
+   - Ask 2-4 focused questions. Do not proceed until you have enough context to write a complete draft.
+
+2. **Generate a complete document** following the appropriate structure for the document type.
+   - Be thorough. Cover all sections even if some require assumptions.
+   - State assumptions explicitly so opponent models can challenge them.
+   - For PRDs: Include placeholder metrics that the user can refine (e.g., "Target: X users in Y days").
+   - For Tech Specs: Include concrete choices (database, framework, etc.) that can be debated.
+
+3. **Present the draft for user review** before sending to opponent models:
+   - Show the full document
+   - Ask: "Does this capture your intent? Any changes before we start the adversarial review?"
+   - Incorporate user feedback before proceeding
+
+Output format (whether loaded or generated):
+```
+[SPEC]
+<document content here>
+[/SPEC]
+```
+
+### Step 2: Send to Opponent Models for Critique
+
+Ask the user which models to debate against. They can specify multiple models (comma-separated) for more thorough review. More models = more perspectives = better spec.
+
+Run the debate script:
+
+```bash
+python3 ~/.claude/skills/adversarial-spec/scripts/debate.py critique --models MODEL_LIST --doc-type TYPE <<'SPEC_EOF'
+<paste your document here>
+SPEC_EOF
+```
+
+Replace:
+- `MODEL_LIST`: comma-separated models (e.g., `gpt-4o` or `gpt-4o,gemini/gemini-2.0-flash,xai/grok-3`)
+- `TYPE`: either `prd` or `tech`
+
+The script calls all models in parallel and returns each model's critique or `[AGREE]`.
+
+### Step 3: Review, Critique, and Iterate
+
+**Important: You (Claude) are an active participant in this debate, not just a moderator.** After receiving opponent model responses, you must:
+
+1. **Provide your own independent critique** of the current spec
+2. **Evaluate opponent critiques** for validity
+3. **Synthesize all feedback** (yours + opponent models) into revisions
+4. **Explain your reasoning** to the user
+
+Display your active participation clearly:
+```
+--- Round N ---
+Opponent Models:
+- [Model A]: <agreed | critiqued: summary>
+- [Model B]: <agreed | critiqued: summary>
+
+Claude's Critique:
+<Your own independent analysis of the spec. What did you find that the opponent models missed? What do you agree/disagree with?>
+
+Synthesis:
+- Accepted from Model A: <what>
+- Accepted from Model B: <what>
+- Added by Claude: <your contributions>
+- Rejected: <what and why>
+```
+
+**Handling Early Agreement (Anti-Laziness Check):**
+
+If any model says `[AGREE]` within the first 2 rounds, be skeptical. Press the model by running another critique round with explicit instructions:
+
+```bash
+python3 ~/.claude/skills/adversarial-spec/scripts/debate.py critique --models MODEL_NAME --doc-type TYPE --press <<'SPEC_EOF'
+<spec here>
+SPEC_EOF
+```
+
+The `--press` flag instructs the model to:
+- Confirm it read the ENTIRE document
+- List at least 3 specific sections it reviewed
+- Explain WHY it agrees (what makes the spec complete)
+- Identify ANY remaining concerns, however minor
+
+If the model truly agrees after being pressed, output to the user:
+```
+Model X confirms agreement after verification:
+- Sections reviewed: [list]
+- Reason for agreement: [explanation]
+- Minor concerns noted: [if any]
+```
+
+If the model was being lazy and now has critiques, continue the debate normally.
+
+**If ALL models (including you) agree:**
+- Proceed to Step 4
+
+**If ANY participant (model or you) has critiques:**
+1. List every distinct issue raised across all participants
+2. For each issue, determine if it is valid (addresses a real gap) or subjective (style preference)
+3. **If a critique raises a question that requires user input, ask the user before revising.** Examples:
+   - "Model X suggests adding rate limiting. What are your expected traffic patterns?"
+   - "I noticed the auth mechanism is unspecified. Do you have a preference (OAuth, API keys, etc.)?"
+   - Do not guess on product decisions. Ask.
+4. Address all valid issues in your revision
+5. If you disagree with a critique, explain why in your response
+6. Output the revised document incorporating all accepted feedback
+7. Go back to Step 2 with your new document
+
+**Handling conflicting critiques:**
+- If models suggest contradictory changes, evaluate each on merit
+- If the choice is a product decision (not purely technical), ask the user which approach they prefer
+- Choose the approach that best serves the document's audience
+- Note the tradeoff in your response
+
+### Step 4: Finalize and Output Document
+
+When ALL opponent models AND you have said `[AGREE]`:
+
+**Before outputting, perform a final quality check:**
+
+1. **Completeness**: Verify every section from the document structure is present and substantive
+2. **Consistency**: Ensure terminology, formatting, and style are uniform throughout
+3. **Clarity**: Remove any ambiguous language that could be misinterpreted
+4. **Actionability**: Confirm stakeholders can act on this document without asking follow-up questions
+
+**For PRDs, verify:**
+- Executive summary captures the essence in 2-3 paragraphs
+- User personas have names, roles, goals, and pain points
+- Every user story follows "As a [persona], I want [action] so that [benefit]"
+- Success metrics have specific numeric targets and measurement methods
+- Scope explicitly lists what is OUT as well as what is IN
+
+**For Tech Specs, verify:**
+- Architecture diagram or description shows all components and their interactions
+- Every API endpoint has method, path, request schema, response schema, and error codes
+- Data models include field types, constraints, indexes, and relationships
+- Security section addresses authentication, authorization, encryption, and input validation
+- Performance targets include specific latency, throughput, and availability numbers
+
+**Output the final document:**
+
+1. Print the complete, polished document to terminal
+2. Write it to `spec-output.md` in current directory
+3. Print a summary:
+   ```
+   === Debate Complete ===
+   Document: [PRD | Technical Specification]
+   Rounds: N
+   Models: [list of opponent models]
+   Claude's contributions: [summary of what you added/changed]
+
+   Key refinements made:
+   - [bullet points of major changes from initial to final]
+   ```
+4. If Telegram enabled:
+   ```bash
+   python3 ~/.claude/skills/adversarial-spec/scripts/debate.py send-final --models MODEL_LIST --doc-type TYPE --rounds N <<'SPEC_EOF'
+   <final document here>
+   SPEC_EOF
+   ```
+
+### Step 5: User Review Period
+
+**After outputting the finalized document, give the user a review period:**
+
+> "The document is finalized and written to `spec-output.md`. Please review it and let me know if you have any feedback, changes, or concerns.
+>
+> Options:
+> 1. **Accept as-is** - Document is complete
+> 2. **Request changes** - Tell me what to modify, and I'll update the spec
+> 3. **Run another review cycle** - Send the updated spec through another adversarial debate"
+
+**If user requests changes:**
+1. Make the requested modifications to the spec
+2. Show the updated sections
+3. Write the updated spec to file
+4. Ask again: "Changes applied. Would you like to accept, make more changes, or run another review cycle?"
+
+**If user wants another review cycle:**
+- Proceed to Step 6 (Additional Review Cycles)
+
+**If user accepts:**
+- Proceed to Step 7 (PRD to Tech Spec, if applicable)
+
+### Step 6: Additional Review Cycles (Optional)
+
+After the user review period, or if explicitly requested:
+
+> "Would you like to run an additional adversarial review cycle for extra validation?"
+
+**If yes:**
+
+1. Ask if they want to use the same models or different ones:
+   > "Use the same models (MODEL_LIST), or specify different models for this cycle?"
+
+2. Run the adversarial debate again from Step 2 with the current document as input.
+
+3. Track cycle count separately from round count:
+   ```
+   === Cycle 2, Round 1 ===
+   ```
+
+4. When this cycle reaches consensus, return to Step 5 (User Review Period).
+
+5. Update the final summary to reflect total cycles:
+   ```
+   === Debate Complete ===
+   Document: [PRD | Technical Specification]
+   Cycles: 2
+   Total Rounds: 5 (Cycle 1: 3, Cycle 2: 2)
+   Models: Cycle 1: [models], Cycle 2: [models]
+   Claude's contributions: [summary across all cycles]
+   ```
+
+**Use cases for additional cycles:**
+- First cycle with faster/cheaper models (gpt-4o), second cycle with stronger models (o1, claude-opus)
+- First cycle for structure and completeness, second cycle for security or performance focus
+- Fresh perspective after user-requested changes
+
+### Step 7: PRD to Tech Spec Continuation (Optional)
+
+**If the completed document was a PRD**, ask the user:
+
+> "PRD is complete. Would you like to continue into a Technical Specification based on this PRD?"
+
+If yes:
+1. Use the finalized PRD as context and requirements input
+2. Optionally offer interview mode again for technical details
+3. Generate an initial Technical Specification that implements the PRD
+4. Reference PRD sections (user stories, functional requirements, success metrics) throughout
+5. Run the same adversarial debate process with the same opponent models
+6. Output the tech spec to `tech-spec-output.md`
+
+This creates a complete PRD + Tech Spec pair from a single session.
+
+## Convergence Rules
+
+- Maximum 10 rounds per cycle (ask user to continue if reached)
+- ALL models AND Claude must agree for convergence
+- More models = stricter convergence (each adds a perspective)
+- Do not agree prematurely - only accept when document is genuinely complete
+- Apply critique criteria rigorously based on document type
+
+**Quality over speed**: The goal is a document that needs no further refinement. If any participant raises a valid concern, address it thoroughly. A spec that takes 7 rounds but is bulletproof is better than one that converges in 2 rounds with gaps.
+
+**When to say [AGREE]**: Only agree when you would confidently hand this document to:
+- For PRD: A product team starting implementation planning
+- For Tech Spec: An engineering team starting a sprint
+
+**Skepticism of early agreement**: If opponent models agree too quickly (rounds 1-2), they may not have read the full document carefully. Always press for confirmation.
+
+## Telegram Integration (Optional)
+
+Enable real-time notifications and human-in-the-loop feedback. Only active with `--telegram` flag.
+
+### Setup
+
+1. Message @BotFather on Telegram, send `/newbot`, follow prompts
+2. Copy the bot token
+3. Run setup:
+   ```bash
+   python3 ~/.claude/skills/adversarial-spec/scripts/telegram_bot.py setup
+   ```
+4. Message your bot, then run setup again to get chat ID
+5. Set environment variables:
+   ```bash
+   export TELEGRAM_BOT_TOKEN="your-token"
+   export TELEGRAM_CHAT_ID="your-chat-id"
+   ```
+
+### Usage
+
+```bash
+python3 debate.py critique --model gpt-4o --doc-type tech --telegram <<'SPEC_EOF'
+<document here>
+SPEC_EOF
+```
+
+After each round:
+- Bot sends summary to Telegram
+- 60 seconds to reply with feedback (configurable via `--poll-timeout`)
+- Reply incorporated into next round
+- No reply = auto-continue

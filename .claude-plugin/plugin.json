@@ -1,0 +1,8 @@
+{
+  "name": "adversarial-spec",
+  "version": "1.0.0",
+  "description": "Iteratively refine product specs through multi-model debate until consensus. Claude actively participates alongside GPT, Gemini, Grok, and other models. Includes interview mode, early agreement verification, and optional Telegram integration.",
+  "author": "zscole",
+  "repository": "https://github.com/zscole/adversarial-spec",
+  "keywords": ["spec", "prd", "technical-specification", "llm", "debate", "consensus"]
+}
