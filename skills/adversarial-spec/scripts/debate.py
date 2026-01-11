@@ -6,6 +6,7 @@ Sends specs to multiple LLMs for critique using LiteLLM.
 Usage:
     echo "spec" | python3 debate.py critique --models gpt-4o
     echo "spec" | python3 debate.py critique --models gpt-4o,gemini/gemini-2.0-flash,xai/grok-3 --doc-type prd
+    echo "spec" | python3 debate.py critique --models codex/gpt-5.2-codex,gemini/gemini-2.0-flash --doc-type tech
     echo "spec" | python3 debate.py critique --models gpt-4o --focus security
     echo "spec" | python3 debate.py critique --models gpt-4o --persona "security engineer"
     echo "spec" | python3 debate.py critique --models gpt-4o --context ./api.md --context ./schema.sql
@@ -26,6 +27,9 @@ Supported providers (set corresponding API key):
     xAI:       XAI_API_KEY         models: xai/grok-3, xai/grok-beta, etc.
     Mistral:   MISTRAL_API_KEY     models: mistral/mistral-large, etc.
     Groq:      GROQ_API_KEY        models: groq/llama-3.3-70b, etc.
+    Codex CLI: (ChatGPT subscription) models: codex/gpt-5.2-codex, codex/gpt-5.1-codex-max
+               Install: npm install -g @openai/codex && codex login
+               Reasoning: --codex-reasoning xhigh (minimal, low, medium, high, xhigh)
 
 Document types:
     prd   - Product Requirements Document (business/product focus)
@@ -43,6 +47,8 @@ import argparse
 import json
 import difflib
 import time
+import subprocess
+import shutil
 import concurrent.futures
 from pathlib import Path
 from typing import Optional
@@ -76,9 +82,19 @@ MODEL_COSTS = {
     "mistral/mistral-large": {"input": 2.00, "output": 6.00},
     "groq/llama-3.3-70b-versatile": {"input": 0.59, "output": 0.79},
     "deepseek/deepseek-chat": {"input": 0.14, "output": 0.28},
+    # Codex CLI models (uses ChatGPT subscription, no per-token cost)
+    "codex/gpt-5.2-codex": {"input": 0.0, "output": 0.0},
+    "codex/gpt-5.1-codex-max": {"input": 0.0, "output": 0.0},
+    "codex/gpt-5.1-codex-mini": {"input": 0.0, "output": 0.0},
 }
 
+# Default reasoning effort for Codex CLI (minimal, low, medium, high, xhigh)
+DEFAULT_CODEX_REASONING = "xhigh"
+
 DEFAULT_COST = {"input": 5.00, "output": 15.00}
+
+# Check if Codex CLI is available
+CODEX_AVAILABLE = shutil.which("codex") is not None
 
 PROFILES_DIR = Path.home() / ".config" / "adversarial-spec" / "profiles"
 SESSIONS_DIR = Path.home() / ".config" / "adversarial-spec" / "sessions"
@@ -582,6 +598,100 @@ def list_profiles():
             print(f"  {p.stem} [error reading]")
 
 
+def call_codex_model(
+    system_prompt: str,
+    user_message: str,
+    model: str,
+    reasoning_effort: str = DEFAULT_CODEX_REASONING,
+    timeout: int = 300
+) -> tuple[str, int, int]:
+    """
+    Call Codex CLI in headless mode using ChatGPT subscription.
+
+    Args:
+        system_prompt: System instructions for the model
+        user_message: User prompt to send
+        model: Model name (e.g., "codex/gpt-5.2-codex" -> uses "gpt-5.2-codex")
+        reasoning_effort: Thinking level (minimal, low, medium, high, xhigh). Default: xhigh
+        timeout: Timeout in seconds (default 5 minutes)
+
+    Returns:
+        Tuple of (response_text, input_tokens, output_tokens)
+
+    Raises:
+        RuntimeError: If Codex CLI is not available or fails
+    """
+    if not CODEX_AVAILABLE:
+        raise RuntimeError("Codex CLI not found. Install with: npm install -g @openai/codex")
+
+    # Extract actual model name from "codex/model" format
+    actual_model = model.split("/", 1)[1] if "/" in model else model
+
+    # Combine system prompt and user message for Codex
+    # Codex exec doesn't have separate system/user roles, so we combine them
+    full_prompt = f"""SYSTEM INSTRUCTIONS:
+{system_prompt}
+
+USER REQUEST:
+{user_message}"""
+
+    try:
+        # Run codex exec with JSON output and reasoning effort
+        result = subprocess.run(
+            [
+                "codex", "exec",
+                "--json",
+                "--full-auto",
+                "--model", actual_model,
+                "-c", f'model_reasoning_effort="{reasoning_effort}"',
+                full_prompt
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+
+        if result.returncode != 0:
+            error_msg = result.stderr.strip() or f"Codex exited with code {result.returncode}"
+            raise RuntimeError(f"Codex CLI failed: {error_msg}")
+
+        # Parse JSONL output to extract agent messages
+        response_text = ""
+        input_tokens = 0
+        output_tokens = 0
+
+        for line in result.stdout.strip().split("\n"):
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+
+                # Extract agent message content
+                if event.get("type") == "item.completed":
+                    item = event.get("item", {})
+                    if item.get("type") == "agent_message":
+                        response_text = item.get("text", "")
+
+                # Extract token usage from turn.completed
+                if event.get("type") == "turn.completed":
+                    usage = event.get("usage", {})
+                    input_tokens = usage.get("input_tokens", 0)
+                    output_tokens = usage.get("output_tokens", 0)
+
+            except json.JSONDecodeError:
+                continue  # Skip malformed lines
+
+        if not response_text:
+            raise RuntimeError("No agent message found in Codex output")
+
+        return response_text, input_tokens, output_tokens
+
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"Codex CLI timed out after {timeout}s")
+    except FileNotFoundError:
+        raise RuntimeError("Codex CLI not found in PATH")
+
+
 def call_single_model(
     model: str,
     spec: str,
@@ -591,7 +701,8 @@ def call_single_model(
     focus: Optional[str] = None,
     persona: Optional[str] = None,
     context: Optional[str] = None,
-    preserve_intent: bool = False
+    preserve_intent: bool = False,
+    codex_reasoning: str = DEFAULT_CODEX_REASONING
 ) -> ModelResponse:
     """Send spec to a single model and return response with retry on failure."""
     system_prompt = get_system_prompt(doc_type, persona)
@@ -617,6 +728,46 @@ def call_single_model(
         context_section=context_section
     )
 
+    # Route Codex CLI models to dedicated handler
+    if model.startswith("codex/"):
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                content, input_tokens, output_tokens = call_codex_model(
+                    system_prompt=system_prompt,
+                    user_message=user_message,
+                    model=model,
+                    reasoning_effort=codex_reasoning
+                )
+                agreed = "[AGREE]" in content
+                extracted = extract_spec(content)
+
+                if not agreed and not extracted:
+                    print(f"Warning: {model} provided critique but no [SPEC] tags found. Response may be malformed.", file=sys.stderr)
+
+                cost = cost_tracker.add(model, input_tokens, output_tokens)
+
+                return ModelResponse(
+                    model=model,
+                    response=content,
+                    agreed=agreed,
+                    spec=extracted,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cost=cost
+                )
+            except Exception as e:
+                last_error = str(e)
+                if attempt < MAX_RETRIES - 1:
+                    delay = RETRY_BASE_DELAY * (2 ** attempt)
+                    print(f"Warning: {model} failed (attempt {attempt + 1}/{MAX_RETRIES}): {last_error}. Retrying in {delay:.1f}s...", file=sys.stderr)
+                    time.sleep(delay)
+                else:
+                    print(f"Error: {model} failed after {MAX_RETRIES} attempts: {last_error}", file=sys.stderr)
+
+        return ModelResponse(model=model, response="", agreed=False, spec=None, error=last_error)
+
+    # Standard litellm path for all other providers
     last_error = None
     for attempt in range(MAX_RETRIES):
         try:
@@ -671,14 +822,15 @@ def call_models_parallel(
     focus: Optional[str] = None,
     persona: Optional[str] = None,
     context: Optional[str] = None,
-    preserve_intent: bool = False
+    preserve_intent: bool = False,
+    codex_reasoning: str = DEFAULT_CODEX_REASONING
 ) -> list[ModelResponse]:
     """Call multiple models in parallel and collect responses."""
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(models)) as executor:
         future_to_model = {
             executor.submit(
-                call_single_model, model, spec, round_num, doc_type, press, focus, persona, context, preserve_intent
+                call_single_model, model, spec, round_num, doc_type, press, focus, persona, context, preserve_intent, codex_reasoning
             ): model
             for model in models
         }
@@ -796,6 +948,14 @@ def list_providers():
         print(f"  {name:12} {key:24} {status}")
         print(f"             Example models: {models}")
         print()
+
+    # Codex CLI (uses ChatGPT subscription, not API key)
+    codex_status = "[installed]" if CODEX_AVAILABLE else "[not installed]"
+    print(f"  {'Codex CLI':12} {'(ChatGPT subscription)':24} {codex_status}")
+    print(f"             Example models: codex/gpt-5.2-codex, codex/gpt-5.1-codex-max")
+    print(f"             Reasoning: --codex-reasoning (minimal, low, medium, high, xhigh)")
+    print(f"             Install: npm install -g @openai/codex && codex login")
+    print()
 
 
 def list_focus_areas():
@@ -960,6 +1120,9 @@ Document types:
                         help="Show cost summary after critique")
     parser.add_argument("--preserve-intent", action="store_true",
                         help="Require explicit justification for any removal or substantial modification")
+    parser.add_argument("--codex-reasoning", default=DEFAULT_CODEX_REASONING,
+                        choices=["low", "medium", "high", "xhigh"],
+                        help=f"Reasoning effort for Codex CLI models (default: {DEFAULT_CODEX_REASONING})")
     parser.add_argument("--session", "-s",
                         help="Session ID for state persistence (enables checkpointing and resume)")
     parser.add_argument("--resume",
@@ -1154,7 +1317,8 @@ Document types:
 
     results = call_models_parallel(
         models, spec, args.round, args.doc_type, args.press,
-        args.focus, args.persona, context, args.preserve_intent
+        args.focus, args.persona, context, args.preserve_intent,
+        args.codex_reasoning
     )
 
     errors = [r for r in results if r.error]
