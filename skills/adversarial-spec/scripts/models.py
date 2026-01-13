@@ -28,10 +28,10 @@ except ImportError:
 from prompts import (
     FOCUS_AREAS,
     PRESERVE_INTENT_PROMPT,
-    REVIEW_PROMPT_TEMPLATE,
-    PRESS_PROMPT_TEMPLATE,
     get_system_prompt,
     get_doc_type_name,
+    get_focus_areas,
+    get_review_prompt_template,
 )
 from providers import (
     MODEL_COSTS,
@@ -227,6 +227,221 @@ def extract_tasks(response: str) -> list[dict]:
     return tasks
 
 
+def extract_findings(response: str) -> list[dict]:
+    """Extract code review findings from [FINDING]...[/FINDING] blocks.
+
+    Args:
+        response: Model response containing [FINDING] blocks.
+
+    Returns:
+        List of finding dictionaries with severity, category, file, etc.
+    """
+    findings = []
+    parts = response.split("[FINDING]")
+
+    for part in parts[1:]:
+        if "[/FINDING]" not in part:
+            continue
+        finding_text = part.split("[/FINDING]")[0].strip()
+        finding: dict[str, str] = {}
+        current_key: str | None = None
+        current_value: list[str] = []
+
+        for line in finding_text.split("\n"):
+            stripped = line.strip()
+
+            # Check for known keys
+            for key in [
+                "severity",
+                "category",
+                "file",
+                "lines",
+                "description",
+                "code",
+                "recommendation",
+            ]:
+                if stripped.lower().startswith(f"{key}:"):
+                    # Save previous key's value
+                    if current_key:
+                        finding[current_key] = "\n".join(current_value).strip()
+                    current_key = key
+                    # Handle value after colon
+                    value_after_colon = stripped[len(key) + 1 :].strip()
+                    # For 'code' field, check if it starts with '|' for multiline
+                    if key == "code" and value_after_colon == "|":
+                        current_value = []
+                    else:
+                        current_value = [value_after_colon] if value_after_colon else []
+                    break
+            else:
+                # No key matched, append to current value
+                if current_key:
+                    current_value.append(line.rstrip())
+
+        # Save the last key's value
+        if current_key:
+            finding[current_key] = "\n".join(current_value).strip()
+
+        # Normalize severity
+        if "severity" in finding:
+            finding["severity"] = finding["severity"].upper()
+            # Handle variations like "CRITICAL:" or "critical"
+            for sev in ["CRITICAL", "MAJOR", "MINOR", "NITPICK"]:
+                if sev in finding["severity"]:
+                    finding["severity"] = sev
+                    break
+
+        # Only add if we have at least description
+        if finding.get("description"):
+            findings.append(finding)
+
+    return findings
+
+
+def merge_findings(
+    all_model_findings: list[tuple[str, list[dict]]]
+) -> tuple[list[dict], list[dict]]:
+    """Merge findings from multiple models, tracking agreement.
+
+    Args:
+        all_model_findings: List of (model_name, findings_list) tuples.
+
+    Returns:
+        Tuple of (agreed_findings, contested_findings).
+        Each finding has 'agreed_by' or 'contested_by' field added.
+    """
+    if not all_model_findings:
+        return [], []
+
+    # Group findings by (file, severity, description similarity)
+    # For now, use simple matching on file + first 50 chars of description
+    def finding_key(f: dict) -> str:
+        file_part = f.get("file", "unknown")[:50]
+        desc_part = f.get("description", "")[:50].lower()
+        return f"{file_part}:{desc_part}"
+
+    # Collect all findings with model attribution
+    finding_groups: dict[str, list[tuple[str, dict]]] = {}
+    for model_name, findings in all_model_findings:
+        for finding in findings:
+            key = finding_key(finding)
+            if key not in finding_groups:
+                finding_groups[key] = []
+            finding_groups[key].append((model_name, finding))
+
+    agreed = []
+    contested = []
+    total_models = len(all_model_findings)
+
+    for key, model_findings in finding_groups.items():
+        models_found = [m for m, _ in model_findings]
+        # Use the most detailed finding (longest description)
+        best_finding = max(
+            [f for _, f in model_findings],
+            key=lambda f: len(f.get("description", "")),
+        )
+
+        if len(models_found) >= total_models * 0.5:  # Majority agreement
+            best_finding["agreed_by"] = models_found
+            agreed.append(best_finding)
+        else:
+            best_finding["found_by"] = models_found
+            best_finding["not_found_by"] = [
+                m for m, _ in all_model_findings if m not in models_found
+            ]
+            contested.append(best_finding)
+
+    # Sort by severity
+    severity_order = {"CRITICAL": 0, "MAJOR": 1, "MINOR": 2, "NITPICK": 3}
+    agreed.sort(key=lambda f: severity_order.get(f.get("severity", "MINOR"), 2))
+    contested.sort(key=lambda f: severity_order.get(f.get("severity", "MINOR"), 2))
+
+    return agreed, contested
+
+
+def format_findings_report(
+    agreed: list[dict],
+    contested: list[dict],
+    title: str = "Code Review",
+    models: list[str] | None = None,
+) -> str:
+    """Format findings into a markdown report.
+
+    Args:
+        agreed: List of agreed-upon findings.
+        contested: List of contested findings.
+        title: Report title.
+        models: List of model names that participated.
+
+    Returns:
+        Formatted markdown report.
+    """
+    # Count by severity
+    severity_counts = {"CRITICAL": 0, "MAJOR": 0, "MINOR": 0, "NITPICK": 0}
+    for f in agreed:
+        sev = f.get("severity", "MINOR")
+        if sev in severity_counts:
+            severity_counts[sev] += 1
+
+    report = f"""# {title}
+
+## Summary
+- Total findings: {len(agreed)} agreed, {len(contested)} contested
+- Critical: {severity_counts['CRITICAL']}
+- Major: {severity_counts['MAJOR']}
+- Minor: {severity_counts['MINOR']}
+- Nitpicks: {severity_counts['NITPICK']}
+"""
+    if models:
+        report += f"- Models: {', '.join(models)}\n"
+
+    if agreed:
+        report += "\n## Agreed Findings\n\n"
+        for i, f in enumerate(agreed, 1):
+            sev = f.get("severity", "UNKNOWN")
+            cat = f.get("category", "General")
+            file_loc = f.get("file", "unknown")
+            lines = f.get("lines", "")
+            if lines:
+                file_loc = f"{file_loc}:{lines}"
+
+            report += f"### {i}. [{sev}] {cat}\n\n"
+            report += f"**Location:** `{file_loc}`\n\n"
+            report += f"**Description:** {f.get('description', 'No description')}\n\n"
+
+            if f.get("code"):
+                report += f"**Code:**\n```\n{f['code']}\n```\n\n"
+
+            if f.get("recommendation"):
+                report += f"**Recommendation:** {f['recommendation']}\n\n"
+
+            if f.get("agreed_by"):
+                report += f"*Found by: {', '.join(f['agreed_by'])}*\n\n"
+
+            report += "---\n\n"
+
+    if contested:
+        report += "\n## Contested Findings\n\n"
+        report += "*These findings were not agreed upon by all models.*\n\n"
+        for i, f in enumerate(contested, 1):
+            sev = f.get("severity", "UNKNOWN")
+            cat = f.get("category", "General")
+            file_loc = f.get("file", "unknown")
+
+            report += f"### {i}. [{sev}] {cat}\n\n"
+            report += f"**Location:** `{file_loc}`\n\n"
+            report += f"**Description:** {f.get('description', 'No description')}\n\n"
+
+            if f.get("found_by"):
+                report += f"*Found by: {', '.join(f['found_by'])}*\n"
+            if f.get("not_found_by"):
+                report += f"*Not flagged by: {', '.join(f['not_found_by'])}*\n\n"
+
+            report += "---\n\n"
+
+    return report
+
+
 def get_critique_summary(response: str, max_length: int = 300) -> str:
     """Get a summary of the critique portion of a response."""
     spec_start = response.find("[SPEC]")
@@ -377,8 +592,13 @@ def call_single_model(
     system_prompt = get_system_prompt(doc_type, persona)
     doc_type_name = get_doc_type_name(doc_type)
 
+    # Get appropriate focus areas for document type
+    available_focus_areas = get_focus_areas(doc_type)
     focus_section = ""
-    if focus and focus.lower() in FOCUS_AREAS:
+    if focus and focus.lower() in available_focus_areas:
+        focus_section = available_focus_areas[focus.lower()]
+    elif focus and focus.lower() in FOCUS_AREAS:
+        # Fall back to generic focus areas
         focus_section = FOCUS_AREAS[focus.lower()]
     elif focus:
         focus_section = f"**CRITICAL FOCUS: {focus.upper()}**\nPrioritize analysis of {focus} concerns above all else."
@@ -388,7 +608,8 @@ def call_single_model(
 
     context_section = context if context else ""
 
-    template = PRESS_PROMPT_TEMPLATE if press else REVIEW_PROMPT_TEMPLATE
+    # Get appropriate prompt template for document type
+    template = get_review_prompt_template(doc_type, press)
     user_message = template.format(
         round=round_num,
         doc_type_name=doc_type_name,

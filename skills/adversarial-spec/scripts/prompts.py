@@ -284,20 +284,216 @@ Extract:
 
 Be thorough. Every actionable item in the spec should become a task."""
 
+# =============================================================================
+# Code Review Prompts
+# =============================================================================
+
+SYSTEM_PROMPT_CODE_REVIEW = """You are a senior software engineer participating in adversarial code review.
+
+You will receive a code diff (changes) to review. Your job is to critique it rigorously.
+
+Analyze the code changes for:
+- Bugs and logic errors
+- Security vulnerabilities (injection, auth issues, data exposure)
+- Performance problems (N+1 queries, unnecessary allocations, blocking calls)
+- Error handling gaps (uncaught exceptions, missing validation)
+- API contract violations
+- Race conditions and concurrency issues
+- Resource leaks (memory, file handles, connections)
+- Breaking changes to public interfaces
+- Test coverage gaps
+- Code style and maintainability issues
+
+For each issue found, output in this exact format:
+
+[FINDING]
+severity: CRITICAL | MAJOR | MINOR | NITPICK
+category: Bug | Security | Performance | Error-Handling | Style | Architecture | Testing
+file: path/to/file.py
+lines: 42-58
+description: What's wrong and why it matters
+code: |
+  the problematic code snippet
+recommendation: How to fix it
+[/FINDING]
+
+Severity guidelines:
+- CRITICAL: Will cause data loss, security breach, or system failure. Must fix before merge.
+- MAJOR: Significant bug or design flaw. Should fix before merge.
+- MINOR: Code smell or minor issue. Fix if time permits.
+- NITPICK: Style preference or minor improvement. Optional.
+
+After listing all findings, provide:
+1. A summary of the most important issues
+2. Overall assessment: APPROVE, REQUEST_CHANGES, or NEEDS_DISCUSSION
+
+If you find NO issues after thorough review:
+- Output exactly [AGREE] on its own line
+- List what you specifically verified was correct
+- Explain why the code is ready to merge
+
+Be rigorous. Code that ships with bugs costs 10x more to fix in production.
+Challenge assumptions. Question edge cases. Think like an attacker for security review."""
+
+CODE_REVIEW_PROMPT_TEMPLATE = """This is round {round} of adversarial code review.
+
+{spec}
+
+{context_section}
+{focus_section}
+Review these code changes according to your criteria. Find issues using [FINDING] tags, or say [AGREE] if the code is ready to merge."""
+
+CODE_REVIEW_PRESS_PROMPT_TEMPLATE = """This is round {round} of adversarial code review. You previously indicated approval.
+
+{spec}
+
+{context_section}
+**IMPORTANT: Please confirm your approval by thoroughly reviewing the ENTIRE diff.**
+
+Before saying [AGREE], you MUST:
+1. Confirm you have reviewed every changed file
+2. List at least 3 specific areas you verified (error handling, edge cases, security, etc.)
+3. Explain WHY you approve - what makes this code ready to merge?
+4. Identify ANY remaining concerns, however minor (even style suggestions)
+
+If after this thorough review you find issues you missed before, provide your findings.
+
+If you genuinely approve after careful review, output:
+1. Your verification (areas reviewed, reasons for approval, minor concerns)
+2. [AGREE] on its own line"""
+
+CODE_REVIEW_FOCUS_AREAS = {
+    "security": """
+**CRITICAL FOCUS: SECURITY**
+Prioritize security analysis above all else. Specifically examine:
+- Input validation and sanitization (SQL injection, XSS, command injection)
+- Authentication and authorization checks
+- Sensitive data exposure (secrets, PII, tokens in logs)
+- Cryptographic issues (weak algorithms, hardcoded keys)
+- SSRF, CSRF, and other web vulnerabilities
+- Deserialization vulnerabilities
+- Path traversal attacks
+- Privilege escalation risks
+Flag any security gaps as CRITICAL findings.""",
+    "performance": """
+**CRITICAL FOCUS: PERFORMANCE**
+Prioritize performance analysis above all else. Specifically examine:
+- N+1 query patterns and database inefficiencies
+- Unnecessary memory allocations or copies
+- Blocking operations in async code
+- Missing indexes or inefficient queries
+- Unbounded loops or recursion
+- Large payload sizes
+- Missing pagination
+- Cache invalidation issues
+Flag any performance gaps as MAJOR findings.""",
+    "error-handling": """
+**CRITICAL FOCUS: ERROR HANDLING**
+Prioritize error handling analysis above all else. Specifically examine:
+- Uncaught exceptions and missing try/catch blocks
+- Silent failures that swallow errors
+- Missing input validation
+- Inadequate error messages
+- Missing rollback/cleanup on failure
+- Partial failure handling
+- Retry logic without backoff
+- Timeout handling
+Flag any error handling gaps as MAJOR findings.""",
+    "testing": """
+**CRITICAL FOCUS: TESTING**
+Prioritize test coverage analysis above all else. Specifically examine:
+- Missing unit tests for new code
+- Untested edge cases and boundary conditions
+- Missing integration tests for APIs
+- Insufficient mocking of external dependencies
+- Missing negative test cases
+- Flaky test patterns
+- Test isolation issues
+- Missing assertions
+Flag any testing gaps as MAJOR findings.""",
+    "api-design": """
+**CRITICAL FOCUS: API DESIGN**
+Prioritize API design analysis above all else. Specifically examine:
+- Breaking changes to existing contracts
+- Inconsistent naming conventions
+- Missing or inadequate documentation
+- Versioning concerns
+- Response format consistency
+- Error response structures
+- Pagination patterns
+- Rate limiting considerations
+Flag any API design issues as MAJOR findings.""",
+    "concurrency": """
+**CRITICAL FOCUS: CONCURRENCY**
+Prioritize concurrency analysis above all else. Specifically examine:
+- Race conditions and data races
+- Deadlock potential
+- Missing synchronization
+- Thread safety of shared state
+- Atomic operation requirements
+- Lock ordering issues
+- Resource contention
+- Async/await correctness
+Flag any concurrency issues as CRITICAL findings.""",
+}
+
+CODE_REVIEW_PERSONAS = {
+    "security-auditor": "You are a security auditor with expertise in application security. Think like an attacker. Look for injection vulnerabilities, authentication bypasses, data exposure, and any way to compromise the system.",
+    "performance-engineer": "You are a performance engineer. Focus on efficiency, scalability, and resource usage. Look for N+1 queries, memory leaks, blocking operations, and anything that will cause problems at scale.",
+    "api-reviewer": "You are an API design expert. Focus on interface contracts, backward compatibility, consistency, documentation, and developer experience for API consumers.",
+    "reliability-engineer": "You are a reliability engineer. Focus on error handling, failure modes, graceful degradation, observability, and ensuring the system behaves correctly under adverse conditions.",
+    "test-engineer": "You are a test engineer. Focus on test coverage, edge cases, test quality, and ensuring the code is properly tested before it ships.",
+}
+
+FIX_SPEC_PROMPT = """Based on the following code review findings, generate a technical specification for fixing these issues.
+
+## Code Review Findings
+
+{findings}
+
+## Instructions
+
+Generate a technical specification that addresses all CRITICAL and MAJOR findings. The spec should include:
+
+1. **Overview**: Summary of issues to be fixed
+2. **Goals**: What successful fixes look like
+3. **Non-Goals**: What's out of scope
+4. **Detailed Fix Plan**: For each issue:
+   - Current problem
+   - Proposed solution
+   - Implementation approach
+   - Testing requirements
+5. **Risk Assessment**: What could go wrong with these fixes
+6. **Testing Strategy**: How to verify fixes work correctly
+
+Output the specification between [SPEC] and [/SPEC] tags."""
+
 
 def get_system_prompt(doc_type: str, persona: Optional[str] = None) -> str:
     """Get the system prompt for a given document type and optional persona."""
     if persona:
         persona_key = persona.lower().replace(" ", "-").replace("_", "-")
-        if persona_key in PERSONAS:
+        # Check code review personas first for code-review doc type
+        if doc_type == "code-review" and persona_key in CODE_REVIEW_PERSONAS:
+            return CODE_REVIEW_PERSONAS[persona_key]
+        elif persona_key in PERSONAS:
             return PERSONAS[persona_key]
+        elif persona_key in CODE_REVIEW_PERSONAS:
+            return CODE_REVIEW_PERSONAS[persona_key]
         else:
-            return f"You are a {persona} participating in adversarial spec development. Review the document from your professional perspective and critique any issues you find."
+            activity = (
+                "adversarial code review"
+                if doc_type == "code-review"
+                else "adversarial spec development"
+            )
+            return f"You are a {persona} participating in {activity}. Review the document from your professional perspective and critique any issues you find."
 
     if doc_type == "prd":
         return SYSTEM_PROMPT_PRD
     elif doc_type == "tech":
         return SYSTEM_PROMPT_TECH
+    elif doc_type == "code-review":
+        return SYSTEM_PROMPT_CODE_REVIEW
     else:
         return SYSTEM_PROMPT_GENERIC
 
@@ -308,5 +504,21 @@ def get_doc_type_name(doc_type: str) -> str:
         return "Product Requirements Document"
     elif doc_type == "tech":
         return "Technical Specification"
+    elif doc_type == "code-review":
+        return "Code Review"
     else:
         return "specification"
+
+
+def get_focus_areas(doc_type: str) -> dict:
+    """Get focus areas for a given document type."""
+    if doc_type == "code-review":
+        return CODE_REVIEW_FOCUS_AREAS
+    return FOCUS_AREAS
+
+
+def get_review_prompt_template(doc_type: str, press: bool = False) -> str:
+    """Get the appropriate review prompt template for a document type."""
+    if doc_type == "code-review":
+        return CODE_REVIEW_PRESS_PROMPT_TEMPLATE if press else CODE_REVIEW_PROMPT_TEMPLATE
+    return PRESS_PROMPT_TEMPLATE if press else REVIEW_PROMPT_TEMPLATE

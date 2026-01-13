@@ -20,6 +20,12 @@ Usage:
     python3 debate.py profiles
     python3 debate.py sessions
 
+Code review commands:
+    python3 debate.py review --base main --models gpt-4o
+    python3 debate.py review --uncommitted --models gpt-4o
+    python3 debate.py review --commit abc123 --models gpt-4o
+    python3 debate.py review --base main --focus security --models gpt-4o
+
 Supported providers (set corresponding API key):
     OpenAI:    OPENAI_API_KEY      models: gpt-4o, gpt-4-turbo, o1, etc.
     Anthropic: ANTHROPIC_API_KEY   models: claude-sonnet-4-20250514, claude-opus-4-20250514, etc.
@@ -32,8 +38,9 @@ Supported providers (set corresponding API key):
                Reasoning: --codex-reasoning xhigh (minimal, low, medium, high, xhigh)
 
 Document types:
-    prd   - Product Requirements Document (business/product focus)
-    tech  - Technical Specification / Architecture Document (engineering focus)
+    prd         - Product Requirements Document (business/product focus)
+    tech        - Technical Specification / Architecture Document (engineering focus)
+    code-review - Code Review (for review action)
 
 Exit codes:
     0 - Success
@@ -81,10 +88,14 @@ from models import (  # noqa: E402
     cost_tracker,
     load_context_files,
     extract_tasks,
+    extract_findings,
+    merge_findings,
+    format_findings_report,
     get_critique_summary,
     generate_diff,
     call_models_parallel,
 )
+import git_utils  # noqa: E402
 
 
 def send_telegram_notification(
@@ -236,6 +247,12 @@ Examples:
   python3 debate.py profiles
   python3 debate.py save-profile myprofile --models gpt-4o,gemini/gemini-2.0-flash --focus security
 
+Code review:
+  python3 debate.py review --base main --models gpt-4o          # PR-style review
+  python3 debate.py review --uncommitted --models gpt-4o        # Review uncommitted changes
+  python3 debate.py review --commit abc123 --models gpt-4o      # Review specific commit
+  python3 debate.py review --base main --focus security         # Security-focused review
+
 Bedrock commands:
   python3 debate.py bedrock status                           # Show Bedrock config
   python3 debate.py bedrock enable --region us-east-1        # Enable Bedrock mode
@@ -253,6 +270,7 @@ Document types:
         "action",
         choices=[
             "critique",
+            "review",
             "providers",
             "send-final",
             "diff",
@@ -367,6 +385,35 @@ Document types:
         "bedrock_arg",
         nargs="?",
         help="Additional argument for bedrock subcommands (model name or alias target)",
+    )
+    # Code review specific arguments
+    parser.add_argument(
+        "--base",
+        help="Base branch for PR-style code review (e.g., main, develop)",
+    )
+    parser.add_argument(
+        "--uncommitted",
+        action="store_true",
+        help="Review uncommitted changes (staged + unstaged)",
+    )
+    parser.add_argument(
+        "--commit",
+        help="Review a specific commit by SHA",
+    )
+    parser.add_argument(
+        "--custom-instructions",
+        help="Custom review instructions to include",
+    )
+    parser.add_argument(
+        "--files",
+        action="append",
+        default=[],
+        help="Include full file context for specific files (can be used multiple times)",
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        help="Output file for review results (default: code-review-output.md)",
     )
     return parser
 
@@ -521,7 +568,7 @@ def setup_bedrock(
     bedrock_mode = bedrock_config.get("enabled", False)
     bedrock_region = bedrock_config.get("region")
 
-    if not bedrock_mode or args.action != "critique":
+    if not bedrock_mode or args.action not in ("critique", "review"):
         return models, bedrock_mode, bedrock_region
 
     available = bedrock_config.get("available_models", [])
@@ -622,6 +669,208 @@ def handle_export_tasks(args: argparse.Namespace, models: list[str]) -> None:
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
+
+
+def handle_review_command(
+    args: argparse.Namespace,
+    models: list[str],
+    context: Optional[str],
+    bedrock_mode: bool,
+    bedrock_region: Optional[str],
+) -> None:
+    """Handle the review action - get diff and run code review debate.
+
+    Args:
+        args: Parsed command-line arguments.
+        models: List of model identifiers.
+        context: Optional context string.
+        bedrock_mode: Whether Bedrock mode is enabled.
+        bedrock_region: AWS region for Bedrock.
+    """
+    # Check if we're in a git repo
+    if not git_utils.is_git_repo():
+        print("Error: Not in a git repository", file=sys.stderr)
+        sys.exit(2)
+
+    # Determine review type from args
+    diff_result = None
+    try:
+        if args.base:
+            diff_result = git_utils.get_branch_diff(args.base)
+        elif args.uncommitted:
+            diff_result = git_utils.get_uncommitted_diff()
+        elif args.commit:
+            diff_result = git_utils.get_commit_diff(args.commit)
+        else:
+            # Default to uncommitted if no option specified
+            diff_result = git_utils.get_uncommitted_diff()
+            if not diff_result.diff.strip():
+                # No uncommitted changes, try diff against default branch
+                default_branch = git_utils.get_default_branch()
+                print(
+                    f"No uncommitted changes. Reviewing against {default_branch}...",
+                    file=sys.stderr,
+                )
+                diff_result = git_utils.get_branch_diff(default_branch)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    if not diff_result or not diff_result.diff.strip():
+        print("Error: No changes to review", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Reviewing: {diff_result.title}", file=sys.stderr)
+    print(f"Files changed: {len(diff_result.files)}", file=sys.stderr)
+
+    # Load file context if requested
+    file_context = None
+    if args.files:
+        file_context = {}
+        for file_path in args.files:
+            content = git_utils.get_file_content(file_path)
+            if content:
+                file_context[file_path] = content
+            else:
+                print(f"Warning: Could not read {file_path}", file=sys.stderr)
+
+    # Build review document
+    review_doc = git_utils.build_review_document(
+        diff_result,
+        file_context,
+        getattr(args, "custom_instructions", None),
+    )
+
+    # Set doc_type to code-review
+    args.doc_type = "code-review"
+
+    # Run the critique loop
+    focus_info = f" (focus: {args.focus})" if args.focus else ""
+    persona_info = f" (persona: {args.persona})" if args.persona else ""
+    print(
+        f"Calling {len(models)} model(s) for code review{focus_info}{persona_info}: {', '.join(models)}...",
+        file=sys.stderr,
+    )
+
+    results = call_models_parallel(
+        models,
+        review_doc,
+        args.round,
+        args.doc_type,
+        args.press,
+        args.focus,
+        args.persona,
+        context,
+        args.preserve_intent,
+        args.codex_reasoning,
+        args.codex_search,
+        args.timeout,
+        bedrock_mode,
+        bedrock_region,
+    )
+
+    errors = [r for r in results if r.error]
+    for err_result in errors:
+        print(
+            f"Warning: {err_result.model} returned error: {err_result.error}",
+            file=sys.stderr,
+        )
+
+    successful = [r for r in results if not r.error]
+
+    # Extract findings from all models
+    all_model_findings = []
+    for r in successful:
+        findings = extract_findings(r.response)
+        all_model_findings.append((r.model, findings))
+        if not r.agreed and not findings:
+            print(
+                f"Warning: {r.model} critiqued but no [FINDING] tags found.",
+                file=sys.stderr,
+            )
+
+    # Merge findings
+    agreed_findings, contested_findings = merge_findings(all_model_findings)
+
+    # Check agreement
+    all_agreed = all(r.agreed for r in successful) if successful else False
+
+    # Output results
+    if args.json:
+        output: dict[str, Any] = {
+            "all_agreed": all_agreed,
+            "round": args.round,
+            "doc_type": args.doc_type,
+            "review_title": diff_result.title,
+            "files_changed": diff_result.files,
+            "models": models,
+            "focus": args.focus,
+            "persona": args.persona,
+            "agreed_findings": agreed_findings,
+            "contested_findings": contested_findings,
+            "results": [
+                {
+                    "model": r.model,
+                    "agreed": r.agreed,
+                    "response": r.response,
+                    "error": r.error,
+                    "findings_count": len(
+                        next(
+                            (f for m, f in all_model_findings if m == r.model),
+                            [],
+                        )
+                    ),
+                    "input_tokens": r.input_tokens,
+                    "output_tokens": r.output_tokens,
+                    "cost": r.cost,
+                }
+                for r in results
+            ],
+            "cost": {
+                "total": cost_tracker.total_cost,
+                "input_tokens": cost_tracker.total_input_tokens,
+                "output_tokens": cost_tracker.total_output_tokens,
+                "by_model": cost_tracker.by_model,
+            },
+        }
+        print(json.dumps(output, indent=2))
+    else:
+        # Generate report
+        report = format_findings_report(
+            agreed_findings,
+            contested_findings,
+            diff_result.title,
+            models,
+        )
+        print(report)
+
+        # Write to file
+        output_file = args.output or "code-review-output.md"
+        try:
+            Path(output_file).write_text(report)
+            print(f"\nReport written to: {output_file}", file=sys.stderr)
+        except OSError as e:
+            print(f"Warning: Could not write output file: {e}", file=sys.stderr)
+
+        # Summary
+        print(f"\n=== Review Summary ===", file=sys.stderr)
+        print(f"Models: {', '.join(models)}", file=sys.stderr)
+        print(
+            f"Findings: {len(agreed_findings)} agreed, {len(contested_findings)} contested",
+            file=sys.stderr,
+        )
+        if all_agreed:
+            print("Status: ALL MODELS APPROVE", file=sys.stderr)
+        else:
+            approving = [r.model for r in successful if r.agreed]
+            critiquing = [r.model for r in successful if not r.agreed]
+            if approving:
+                print(f"Approved by: {', '.join(approving)}", file=sys.stderr)
+            if critiquing:
+                print(f"Issues found by: {', '.join(critiquing)}", file=sys.stderr)
+
+        if args.show_cost:
+            print(cost_tracker.summary())
 
 
 def load_or_resume_session(
@@ -883,6 +1132,10 @@ def main() -> None:
 
     if args.action == "export-tasks":
         handle_export_tasks(args, models)
+        return
+
+    if args.action == "review":
+        handle_review_command(args, models, context, bedrock_mode, bedrock_region)
         return
 
     spec, session_state, models = load_or_resume_session(args, models)

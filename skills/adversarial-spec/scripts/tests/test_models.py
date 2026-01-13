@@ -973,3 +973,215 @@ class TestConstants:
     def test_retry_base_delay_is_positive(self):
         # Mutation: 1.0 -> 2.0 would be caught
         assert RETRY_BASE_DELAY == 1.0
+
+
+# Import new functions for testing
+from models import extract_findings, merge_findings, format_findings_report
+
+
+class TestExtractFindings:
+    def test_extracts_single_finding(self):
+        response = """
+Some preamble text.
+
+[FINDING]
+severity: CRITICAL
+category: Security
+file: auth.py
+lines: 42-58
+description: SQL injection vulnerability in login function
+code: |
+  query = f"SELECT * FROM users WHERE name='{name}'"
+recommendation: Use parameterized queries
+[/FINDING]
+
+Some closing text.
+"""
+        findings = extract_findings(response)
+        assert len(findings) == 1
+        assert findings[0]["severity"] == "CRITICAL"
+        assert findings[0]["category"] == "Security"
+        assert findings[0]["file"] == "auth.py"
+        assert findings[0]["lines"] == "42-58"
+        assert "SQL injection" in findings[0]["description"]
+        assert "parameterized" in findings[0]["recommendation"]
+
+    def test_extracts_multiple_findings(self):
+        response = """
+[FINDING]
+severity: MAJOR
+category: Bug
+file: main.py
+description: Null pointer exception possible
+[/FINDING]
+
+[FINDING]
+severity: MINOR
+category: Style
+file: utils.py
+description: Inconsistent naming
+[/FINDING]
+"""
+        findings = extract_findings(response)
+        assert len(findings) == 2
+        assert findings[0]["severity"] == "MAJOR"
+        assert findings[1]["severity"] == "MINOR"
+
+    def test_normalizes_severity(self):
+        response = """
+[FINDING]
+severity: critical
+description: Test finding
+[/FINDING]
+"""
+        findings = extract_findings(response)
+        assert findings[0]["severity"] == "CRITICAL"
+
+    def test_handles_no_findings(self):
+        response = "[AGREE] - Code looks good!"
+        findings = extract_findings(response)
+        assert findings == []
+
+    def test_requires_description(self):
+        response = """
+[FINDING]
+severity: MAJOR
+file: test.py
+[/FINDING]
+"""
+        findings = extract_findings(response)
+        assert findings == []  # No description, so not added
+
+    def test_handles_multiline_code(self):
+        response = """
+[FINDING]
+severity: MAJOR
+category: Bug
+file: test.py
+description: Issue found
+code: |
+  def foo():
+      return bar
+recommendation: Fix it
+[/FINDING]
+"""
+        findings = extract_findings(response)
+        assert "def foo()" in findings[0]["code"]
+        assert "return bar" in findings[0]["code"]
+
+
+class TestMergeFindings:
+    def test_merges_agreed_findings(self):
+        model_findings = [
+            (
+                "model-a",
+                [{"file": "test.py", "severity": "MAJOR", "description": "Bug found"}],
+            ),
+            (
+                "model-b",
+                [{"file": "test.py", "severity": "MAJOR", "description": "Bug found"}],
+            ),
+        ]
+        agreed, contested = merge_findings(model_findings)
+        assert len(agreed) == 1
+        assert len(contested) == 0
+        assert "model-a" in agreed[0]["agreed_by"]
+        assert "model-b" in agreed[0]["agreed_by"]
+
+    def test_identifies_contested_findings(self):
+        model_findings = [
+            ("model-a", [{"file": "a.py", "description": "Issue in a"}]),
+            ("model-b", [{"file": "b.py", "description": "Issue in b"}]),
+        ]
+        agreed, contested = merge_findings(model_findings)
+        # With 2 models, neither finding has majority
+        assert len(contested) == 2
+
+    def test_sorts_by_severity(self):
+        model_findings = [
+            (
+                "model-a",
+                [
+                    {"file": "a.py", "severity": "MINOR", "description": "Minor issue"},
+                    {
+                        "file": "b.py",
+                        "severity": "CRITICAL",
+                        "description": "Critical issue",
+                    },
+                ],
+            ),
+            (
+                "model-b",
+                [
+                    {"file": "a.py", "severity": "MINOR", "description": "Minor issue"},
+                    {
+                        "file": "b.py",
+                        "severity": "CRITICAL",
+                        "description": "Critical issue",
+                    },
+                ],
+            ),
+        ]
+        agreed, _ = merge_findings(model_findings)
+        assert agreed[0]["severity"] == "CRITICAL"
+        assert agreed[1]["severity"] == "MINOR"
+
+    def test_handles_empty_input(self):
+        agreed, contested = merge_findings([])
+        assert agreed == []
+        assert contested == []
+
+
+class TestFormatFindingsReport:
+    def test_formats_basic_report(self):
+        agreed = [
+            {
+                "severity": "CRITICAL",
+                "category": "Security",
+                "file": "auth.py",
+                "lines": "10-20",
+                "description": "SQL injection",
+                "recommendation": "Use prepared statements",
+                "agreed_by": ["model-a", "model-b"],
+            }
+        ]
+        report = format_findings_report(agreed, [], "Test Review", ["model-a", "model-b"])
+        assert "# Test Review" in report
+        assert "CRITICAL" in report
+        assert "Security" in report
+        assert "auth.py:10-20" in report
+        assert "SQL injection" in report
+        assert "Use prepared statements" in report
+
+    def test_includes_contested_section(self):
+        contested = [
+            {
+                "severity": "MINOR",
+                "category": "Style",
+                "file": "utils.py",
+                "description": "Naming issue",
+                "found_by": ["model-a"],
+                "not_found_by": ["model-b"],
+            }
+        ]
+        report = format_findings_report([], contested, "Review")
+        assert "Contested Findings" in report
+        assert "model-a" in report
+        assert "model-b" in report
+
+    def test_includes_summary_counts(self):
+        agreed = [
+            {"severity": "CRITICAL", "description": "Critical 1"},
+            {"severity": "CRITICAL", "description": "Critical 2"},
+            {"severity": "MAJOR", "description": "Major 1"},
+        ]
+        report = format_findings_report(agreed, [], "Summary Test")
+        assert "Critical: 2" in report
+        assert "Major: 1" in report
+
+    def test_includes_models_list(self):
+        report = format_findings_report(
+            [], [], "Test", ["gpt-4o", "gemini/gemini-2.0-flash"]
+        )
+        assert "gpt-4o" in report
+        assert "gemini/gemini-2.0-flash" in report

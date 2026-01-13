@@ -93,7 +93,43 @@ If a Bedrock model fails (e.g., not enabled in your account), the debate continu
 
 ## Document Types
 
-Ask the user which type of document they want to produce:
+Ask the user which type of document they want to produce (or if they want a code review):
+
+### Code Review
+
+Adversarial code review for PR-style changes, uncommitted work, or specific commits.
+
+**Review Modes:**
+- Review against a base branch (PR style)
+- Review uncommitted changes
+- Review a specific commit
+
+**Output Structure:**
+- Summary (files changed, findings count by severity)
+- Agreed Findings (issues all models found)
+- Contested Findings (issues only some models found)
+- Recommendations
+
+**Finding Format:**
+Each finding includes:
+- Severity: CRITICAL | MAJOR | MINOR | NITPICK
+- Category: Bug | Security | Performance | Error-Handling | Style | Architecture | Testing
+- File and line numbers
+- Description of the issue
+- Code snippet
+- Recommendation for fix
+
+**Critique Criteria:**
+1. Bugs and logic errors
+2. Security vulnerabilities (injection, auth issues, data exposure)
+3. Performance problems (N+1 queries, blocking calls, memory leaks)
+4. Error handling gaps (uncaught exceptions, missing validation)
+5. API contract violations
+6. Race conditions and concurrency issues
+7. Resource leaks
+8. Breaking changes to public interfaces
+9. Test coverage gaps
+10. Code style and maintainability
 
 ### PRD (Product Requirements Document)
 
@@ -523,6 +559,118 @@ If yes:
 
 This creates a complete PRD + Tech Spec pair from a single session.
 
+## Code Review Process
+
+When the user requests a code review (mentions "review", "PR review", "code review", etc.):
+
+### Step 0: Gather Review Input
+
+Present review options using AskUserQuestion:
+
+```
+question: "What would you like to review?"
+header: "Review type"
+options:
+- "Review against a base branch (PR Style)" - Compare current branch to main/develop
+- "Review uncommitted changes" - Review staged and unstaged changes
+- "Review a specific commit" - Review changes from a single commit
+- "Custom review instructions" - Provide specific review focus
+```
+
+### Step 1: Get the Diff
+
+Based on user selection, run the appropriate git command:
+
+**PR-style review:**
+```bash
+python3 ~/.claude/skills/adversarial-spec/scripts/debate.py review --base main --models MODEL_LIST
+```
+
+**Uncommitted changes:**
+```bash
+python3 ~/.claude/skills/adversarial-spec/scripts/debate.py review --uncommitted --models MODEL_LIST
+```
+
+**Specific commit:**
+```bash
+python3 ~/.claude/skills/adversarial-spec/scripts/debate.py review --commit SHA --models MODEL_LIST
+```
+
+### Step 2: Select Models
+
+Same as spec review - use AskUserQuestion to let user select models based on available API keys.
+
+### Step 3: Run Code Review Debate
+
+The script sends the diff to all models for review. Each model returns:
+- `[AGREE]` if code is ready to merge
+- `[FINDING]` blocks for each issue found
+
+**Claude's role**: After receiving model responses, you (Claude) also review the diff and provide your own findings. Synthesize all findings, noting agreement and disagreement.
+
+### Step 4: Review Findings and Iterate
+
+Display results:
+```
+--- Round N ---
+Opponent Models:
+- [Model A]: <approved | N findings>
+- [Model B]: <approved | N findings>
+
+Claude's Review:
+<Your own independent code review findings>
+
+Agreed Findings (found by majority):
+1. [SEVERITY] Category - file:lines - description
+
+Contested Findings (disagreement):
+1. [SEVERITY] Category - found by X, not by Y - description
+```
+
+**If issues found:**
+- Present findings to user
+- Ask if they want another round with specific focus
+- Continue until consensus or user accepts
+
+**If all approve:**
+- Generate final review report
+- Write to `code-review-output.md`
+
+### Step 5: Technical Spec Generation (Optional)
+
+After review completes, if CRITICAL or MAJOR findings exist, offer:
+
+> "Code review complete. Found N critical/major issues.
+>
+> Would you like to generate a technical specification for fixing these issues?"
+
+If yes:
+1. Use the findings as input context
+2. Generate a tech spec that addresses each critical/major issue
+3. Run normal adversarial spec debate on the fix spec
+4. Output to `fix-spec-output.md`
+
+### Code Review Focus Areas
+
+Code review supports these focus areas with `--focus`:
+
+- `security` - Input validation, auth, data exposure, injection vulnerabilities
+- `performance` - N+1 queries, memory allocation, blocking operations
+- `error-handling` - Exception handling, validation, failure modes
+- `testing` - Test coverage, edge cases, test quality
+- `api-design` - Breaking changes, consistency, documentation
+- `concurrency` - Race conditions, thread safety, deadlocks
+
+### Code Review Personas
+
+Code review supports these personas with `--persona`:
+
+- `security-auditor` - Think like an attacker
+- `performance-engineer` - Focus on efficiency and scale
+- `api-reviewer` - Focus on interface design
+- `reliability-engineer` - Focus on failure modes
+- `test-engineer` - Focus on testability and coverage
+
 ## Convergence Rules
 
 - Maximum 10 rounds per cycle (ask user to continue if reached)
@@ -808,6 +956,11 @@ python3 debate.py critique --resume SESSION_ID
 python3 debate.py diff --previous OLD.md --current NEW.md
 python3 debate.py export-tasks --models MODEL --doc-type TYPE [--json] < spec.md
 
+# Code review commands
+python3 debate.py review --base BRANCH --models MODEL_LIST [OPTIONS]
+python3 debate.py review --uncommitted --models MODEL_LIST [OPTIONS]
+python3 debate.py review --commit SHA --models MODEL_LIST [OPTIONS]
+
 # Info commands
 python3 debate.py providers      # List supported providers and API key status
 python3 debate.py focus-areas    # List available focus areas
@@ -838,3 +991,13 @@ python3 debate.py send-final --models MODEL_LIST --doc-type TYPE --rounds N < sp
 - `--poll-timeout` - Telegram reply timeout in seconds (default: 60)
 - `--json, -j` - Output as JSON
 - `--codex-search` - Enable web search for Codex CLI models (allows researching current info)
+
+**Review options (for `review` action):**
+- `--base` - Base branch for PR-style review (e.g., main, develop)
+- `--uncommitted` - Review uncommitted changes (staged + unstaged)
+- `--commit` - Review a specific commit by SHA
+- `--custom-instructions` - Custom review instructions to include
+- `--files` - Include full file context for specific files (can be used multiple times)
+- `--output, -o` - Output file for review results (default: code-review-output.md)
+- `--focus, -f` - Focus area (security, performance, error-handling, testing, api-design, concurrency)
+- `--persona` - Review persona (security-auditor, performance-engineer, api-reviewer, etc.)
