@@ -145,10 +145,18 @@ def get_branch_diff(base: str, head: str = "HEAD") -> DiffResult:
     Raises:
         ValueError: If base ref doesn't exist.
     """
-    # Verify base exists
+    # Verify base exists, falling back to origin/<branch> if local doesn't exist
     _, _, code = run_git_command(["rev-parse", "--verify", base], check=False)
     if code != 0:
-        raise ValueError(f"Base ref '{base}' not found")
+        # Try origin/<branch> as fallback for repos without local branch
+        remote_base = f"origin/{base}"
+        _, _, remote_code = run_git_command(
+            ["rev-parse", "--verify", remote_base], check=False
+        )
+        if remote_code == 0:
+            base = remote_base
+        else:
+            raise ValueError(f"Base ref '{base}' not found")
 
     # Get merge base for proper PR-style diff
     merge_base = get_merge_base(base, head)
@@ -386,7 +394,15 @@ def get_diff_stats(diff: str) -> dict:
     files = set()
 
     for line in diff.split("\n"):
-        if line.startswith("+++ b/"):
+        # Use diff --git headers to count files (handles both new and deleted)
+        if line.startswith("diff --git "):
+            # Format: diff --git a/path b/path
+            parts = line.split(" ")
+            if len(parts) >= 4:
+                # Extract path from b/path (or a/path for deletions)
+                file_path = parts[3][2:] if parts[3].startswith("b/") else parts[2][2:]
+                files.add(file_path)
+        elif line.startswith("+++ b/"):
             files.add(line[6:])
         elif line.startswith("+") and not line.startswith("+++"):
             insertions += 1

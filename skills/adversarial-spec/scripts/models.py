@@ -247,8 +247,23 @@ def extract_findings(response: str) -> list[dict]:
         current_key: str | None = None
         current_value: list[str] = []
 
+        in_code_block = False
         for line in finding_text.split("\n"):
             stripped = line.strip()
+
+            # If in code block, only exit when we see an unindented known key
+            if in_code_block:
+                # Check if this is an unindented line starting with a known key
+                is_new_key = False
+                if line and not line[0].isspace():
+                    for key in ["severity", "category", "file", "lines", "description", "code", "recommendation"]:
+                        if stripped.lower().startswith(f"{key}:"):
+                            is_new_key = True
+                            in_code_block = False
+                            break
+                if not is_new_key:
+                    current_value.append(line.rstrip())
+                    continue
 
             # Check for known keys
             for key in [
@@ -270,6 +285,7 @@ def extract_findings(response: str) -> list[dict]:
                     # For 'code' field, check if it starts with '|' for multiline
                     if key == "code" and value_after_colon == "|":
                         current_value = []
+                        in_code_block = True
                     else:
                         current_value = [value_after_colon] if value_after_colon else []
                     break
@@ -313,12 +329,13 @@ def merge_findings(
     if not all_model_findings:
         return [], []
 
-    # Group findings by (file, severity, description similarity)
-    # For now, use simple matching on file + first 50 chars of description
+    # Group findings by file + severity + description prefix
+    # Including severity ensures we don't merge CRITICAL with MINOR issues
     def finding_key(f: dict) -> str:
         file_part = f.get("file", "unknown")[:50]
+        severity_part = f.get("severity", "UNKNOWN").upper()
         desc_part = f.get("description", "")[:50].lower()
-        return f"{file_part}:{desc_part}"
+        return f"{file_part}:{severity_part}:{desc_part}"
 
     # Collect all findings with model attribution
     finding_groups: dict[str, list[tuple[str, dict]]] = {}
@@ -341,7 +358,7 @@ def merge_findings(
             key=lambda f: len(f.get("description", "")),
         )
 
-        if len(models_found) >= total_models * 0.5:  # Majority agreement
+        if len(models_found) > total_models / 2:  # Strict majority agreement
             best_finding["agreed_by"] = models_found
             agreed.append(best_finding)
         else:

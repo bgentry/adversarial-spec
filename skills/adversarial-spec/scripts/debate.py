@@ -386,17 +386,18 @@ Document types:
         nargs="?",
         help="Additional argument for bedrock subcommands (model name or alias target)",
     )
-    # Code review specific arguments
-    parser.add_argument(
+    # Code review specific arguments (mutually exclusive review source)
+    review_source = parser.add_mutually_exclusive_group()
+    review_source.add_argument(
         "--base",
         help="Base branch for PR-style code review (e.g., main, develop)",
     )
-    parser.add_argument(
+    review_source.add_argument(
         "--uncommitted",
         action="store_true",
         help="Review uncommitted changes (staged + unstaged)",
     )
-    parser.add_argument(
+    review_source.add_argument(
         "--commit",
         help="Review a specific commit by SHA",
     )
